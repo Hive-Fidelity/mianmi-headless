@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mianmi-headless"
+version = "0.1.0"
+description = "Headless mianmi agent harness — 1M context, OpenAI Responses API, traveling gardener, no truncation, no silent fallback"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Kirsten (mianmi project)"},
+]
+dependencies = [
+    # The OpenAI SDK supports the Responses API natively. We use it
+    # directly (not via LiteLLM) so we have hard control over
+    # truncation='disabled' and 1M context — no sneaky chat-completions
+    # fallback, no provider-side truncation. The whole point of this
+    # harness is that it does not silently lie to the agent about
+    # context.
+    "openai>=2.0.0",
+    # For the traveling gardener (M3) sub-agent. We hit the Minimax
+    # subscriber API directly with httpx. No SDK lock-in.
+    "httpx>=0.27.0",
+    # Filesystem watching and CLI niceties
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+# The single entry point that harbor calls.
+mianmi-headless = "mianmi_headless.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mianmi_headless = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:openai.*",
+    "ignore::DeprecationWarning:httpx.*",
+]
