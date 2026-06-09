@@ -45,11 +45,32 @@ from mianmi_headless.events import (
     ToolResultEvent,
     UserEvent,
 )
+from mianmi_headless.paperbench import paperbench_system_prompt
 from mianmi_headless.tools import ToolContext, registry as default_tool_registry
 from mianmi_headless.troll import SEED_CATCHES, TrollToll
 from mianmi_headless.turn_log import Turn, TurnLog
 
 log = logging.getLogger("mianmi_headless.agent")
+
+
+def _default_main_model() -> str:
+    """Resolve the main model name.
+
+    Priority: explicit ``MIANMI_HEADLESS_MODEL`` env var > paperbench
+    auto-detect (gpt-5.5-pro) > base default (gpt-5.5).
+
+    Paperbench tasks are long-running, multi-hour, research-grade —
+    worth the extra cost of gpt-5.5-pro. Non-paperbench tasks
+    (interactive shell, dev) stay on gpt-5.5 to keep costs down.
+    """
+    explicit = os.getenv("MIANMI_HEADLESS_MODEL")
+    if explicit:
+        return explicit
+    if os.getenv("MIANMI_HEADLESS_PAPERBENCH") == "1":
+        return "gpt-5.5-pro"
+    if Path("/workspace/submission/tests/rubrics.json").exists():
+        return "gpt-5.5-pro"
+    return "gpt-5.5"
 
 
 # --------------------------------------------------------------------------- #
@@ -71,7 +92,12 @@ class AgentConfig(BaseModel):
     openai_base_url: str | None = Field(
         default_factory=lambda: os.getenv("OPENAI_BASE_URL") or None
     )
-    main_model: str = Field(default_factory=lambda: os.getenv("MIANMI_HEADLESS_MODEL", "gpt-5.5"))
+    # Model default. The base default is gpt-5.5; for paperbench
+    # mode (auto-detected) we default to gpt-5.5-pro for more
+    # capability on long-running research tasks.
+    main_model: str = Field(
+        default_factory=lambda: _default_main_model()
+    )
     reasoning_effort: str = Field(default_factory=lambda: os.getenv("MIANMI_HEADLESS_REASONING", "high"))
     # truncation='disabled' is the headline feature of this harness.
     # If the context overflows, the API returns an error. We surface
@@ -332,15 +358,22 @@ class HeadlessAgent:
             )
 
             t0 = time.monotonic()
+            # Build the Responses API call. The `instructions` field
+            # is the system prompt; auto-detect paperbench mode and
+            # inject the rubric-aware system prompt if so.
+            kwargs: dict = dict(
+                model=self.config.main_model,
+                input=input_blocks,
+                tools=api_tools,
+                reasoning={"effort": self.config.reasoning_effort},
+                truncation=self.config.truncation,
+                store=False,  # we have our own persistent log
+            )
+            sys_prompt = paperbench_system_prompt()
+            if sys_prompt:
+                kwargs["instructions"] = sys_prompt
             try:
-                response = self.client.responses.create(
-                    model=self.config.main_model,
-                    input=input_blocks,
-                    tools=api_tools,
-                    reasoning={"effort": self.config.reasoning_effort},
-                    truncation=self.config.truncation,
-                    store=False,  # we have our own persistent log
-                )
+                response = self.client.responses.create(**kwargs)
             except Exception as e:
                 log.exception("Responses API call failed at iteration %d", iteration)
                 # Loud failure. Don't try to "fix" it by falling back
