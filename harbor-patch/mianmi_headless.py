@@ -64,7 +64,11 @@ class MianmiHeadless(BaseInstalledAgent):
             "main_model",
             env="MIANMI_HEADLESS_MODEL",
             type="str",
-            default="gpt-5.5",
+            # Default to gpt-5.5-pro for harbor trials (most harbor
+            # tasks are long-running, research-grade, where the
+            # extra capability is worth it). User can override with
+            # `model: gpt-5.5` in harbor task config.
+            default="gpt-5.5-pro",
         ),
         EnvVar(
             "reasoning_effort",
@@ -92,6 +96,16 @@ class MianmiHeadless(BaseInstalledAgent):
             type="enum",
             choices=["0", "1"],
             default="1",
+        ),
+        # Paperbench auto-detect forces the system prompt. Setting
+        # MIANMI_HEADLESS_PAPERBENCH=0 disables it (e.g. for non-paperbench
+        # trials that have a tests/rubrics.json by accident).
+        EnvVar(
+            "paperbench_mode",
+            env="MIANMI_HEADLESS_PAPERBENCH",
+            type="enum",
+            choices=["auto", "0", "1"],
+            default="auto",
         ),
     ]
 

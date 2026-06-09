@@ -131,8 +131,8 @@ SEED_CATCHES: list[dict[str, str]] = [
 
 # Paperbench-specific seed list. These are the patterns the agent
 # is MOST likely to hit on a paperbench task. Activated only when
-# the agent's cwd contains ``tests/rubrics.json`` (auto-detected) or
-# the user sets ``MIANMI_HEADLESS_PAPERBENCH=1``.
+# the user sets ``MIANMI_HEADLESS_PAPERBENCH=1`` (no auto-detect
+# from the verifier's rubric file, since that's a cheating surface).
 
 PAPERBENCH_CATCHES: list[dict[str, str]] = [
     {
@@ -192,20 +192,12 @@ PAPERBENCH_CATCHES: list[dict[str, str]] = [
 def get_catches() -> list[dict[str, str]]:
     """Return the active catch list, paperbench-augmented if applicable.
 
-    Auto-detects paperbench mode by checking for
-    ``/workspace/submission/tests/rubrics.json``. The user can also
-    force it on with ``MIANMI_HEADLESS_PAPERBENCH=1``.
+    Paperbench mode is enabled by setting ``MIANMI_HEADLESS_PAPERBENCH=1``.
+    We do NOT auto-detect from ``/workspace/submission/tests/rubrics.json``
+    because that file is a verifier artifact, not an agent artifact.
     """
     catches: list[dict[str, str]] = list(SEED_CATCHES)
-    paperbench_on = False
-    if __import__("os").environ.get("MIANMI_HEADLESS_PAPERBENCH") == "0":
-        paperbench_on = False
-    elif __import__("os").environ.get("MIANMI_HEADLESS_PAPERBENCH") == "1":
-        paperbench_on = True
-    else:
-        from pathlib import Path
-        paperbench_on = Path("/workspace/submission/tests/rubrics.json").exists()
-    if paperbench_on:
+    if os.environ.get("MIANMI_HEADLESS_PAPERBENCH") == "1":
         catches = list(SEED_CATCHES) + list(PAPERBENCH_CATCHES)
     return catches
 

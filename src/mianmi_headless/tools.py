@@ -254,13 +254,14 @@ def _write_scratchpad(ctx: ToolContext, content: str, append: bool = True) -> st
             accumulate over the run.
     """
     # The paperbench image mounts /workspace/submission/ as the agent's
-    # deliverable directory. If we don't see that path, fall back to
-    # a local scratchpad so the tool still works in dev / test.
-    candidates = [
-        Path("/workspace/submission/scratchpad.md"),
-        ctx.cwd / "scratchpad.md",
-    ]
-    target = candidates[0] if candidates[0].parent.exists() else candidates[1]
+    # deliverable directory. We try that first; if /workspace doesn't
+    # exist, fall back to the cwd-relative path so the tool works
+    # in dev too.
+    workspace_target = Path("/workspace/submission/scratchpad.md")
+    if workspace_target.parent.exists():
+        target = workspace_target
+    else:
+        target = ctx.cwd / "scratchpad.md"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if append and target.exists() else "w"
@@ -299,11 +300,11 @@ def _structured_error(
             "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()
         ),
     }
-    candidates = [
-        Path(f"/workspace/submission/{artifact}"),
-        ctx.cwd / artifact,
-    ]
-    target = candidates[0] if candidates[0].parent.exists() else candidates[1]
+    workspace_target = Path(f"/workspace/submission/{artifact}")
+    if workspace_target.parent.exists():
+        target = workspace_target
+    else:
+        target = ctx.cwd / artifact
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, "w", encoding="utf-8") as f:

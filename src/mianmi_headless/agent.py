@@ -57,18 +57,22 @@ def _default_main_model() -> str:
     """Resolve the main model name.
 
     Priority: explicit ``MIANMI_HEADLESS_MODEL`` env var > paperbench
-    auto-detect (gpt-5.5-pro) > base default (gpt-5.5).
+    mode (gpt-5.5-pro) > base default (gpt-5.5).
 
     Paperbench tasks are long-running, multi-hour, research-grade —
     worth the extra cost of gpt-5.5-pro. Non-paperbench tasks
     (interactive shell, dev) stay on gpt-5.5 to keep costs down.
+
+    Note: we do NOT auto-detect paperbench mode by looking for
+    ``/workspace/submission/tests/rubrics.json`` — that file is a
+    verifier artifact, not an agent artifact, and seeing it would
+    be a form of cheating. The user must explicitly set
+    ``MIANMI_HEADLESS_PAPERBENCH=1`` (or the harbor patch can do it).
     """
     explicit = os.getenv("MIANMI_HEADLESS_MODEL")
     if explicit:
         return explicit
     if os.getenv("MIANMI_HEADLESS_PAPERBENCH") == "1":
-        return "gpt-5.5-pro"
-    if Path("/workspace/submission/tests/rubrics.json").exists():
         return "gpt-5.5-pro"
     return "gpt-5.5"
 

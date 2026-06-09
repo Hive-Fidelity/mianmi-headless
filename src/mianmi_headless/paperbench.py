@@ -1,37 +1,53 @@
 """Paperbench-tuned system prompt for the mianmi-headless harness.
 
-A regular coding agent will, given a paper + a task, get tunnel vision
-on the algorithm implementation and skip the operational leaves
-(L002-L006, L032-L037 in the SAFE rubric). Those leaves are
-deterministic and easy — they just need a few lines of `metrics.json`
-and a `run.log`. Skip them, lose ~30 points immediately.
+The paperbench scoring works like this:
+  - The **verifier** runs in a separate process and reads the leaves
+    in ``tests/rubrics.json`` to score the agent's submission.
+  - The **agent being tested** does NOT have access to the rubric
+    leaves. It only sees ``paper.pdf``, ``task.md``, the
+    ``instruction.md``, the runtime environment, and the network
+    allowlist.
+  - The agent has to **infer** what's being graded from the
+    instructions: ``task.md`` and ``instruction.md`` list the
+    required artifacts (e.g. ``metrics.json``, ``run.sh``,
+    ``REPORT.md``, ``optimizer_probe.json``) and the required
+    reproduction behavior. Those hints are the agent's only spec.
 
-This module gives the harness a "rubric-first" system prompt. When
-``MIANMI_HEADLESS_PAPERBENCH=1`` is set (default for paperbench
-trials), the harness injects this prompt at the start of the run so
-the agent plans deterministically before diving into algorithm code.
+This module gives the harness a "spec-inference" system prompt.
+When ``MIANMI_HEADLESS_PAPERBENCH=1`` is set (or the harness is
+auto-detected via a different mechanism — see ``paperbench_mode()``),
+the harness injects this prompt at the start of the run.
 
-The key instructions, in priority order:
+**The wrong approach** (and what this prompt explicitly does NOT
+recommend): peeking at ``tests/rubrics.json``. In production that
+file is verifier-only and may not even exist. In a misconfigured
+harbor trial where it does exist, reading it would be a form of
+cheating — and any comparison with opus 4.7 (which didn't have
+access) would be unfair.
 
-  1. Read the rubric (``tests/rubrics.json``) FIRST. Note which leaves
-     are deterministic (unit_test, regex_numeric) vs LLM-judge.
-  2. Touch every required artifact path with the minimum content
-     (L001, L005, L032, L033, L034, L035, L037). Even an empty
-     ``run.sh`` and a stub ``metrics.json`` will pass some leaves.
-  3. Document runtime evidence EARLY (L002, L003, L004, L006). These
-     are 2-3 point determinists; do them on turn 1, not at the end.
-  4. The 1M context window can hold the entire paper + the entire
-     rubric. You have no excuse for missing a leaf.
-  5. Use ``ask_gardener`` to recall paper details when you need them.
-     The gardener is M3 with 1M context; cite turn numbers in your
-     answers.
-  6. Write a ``scratchpad.md`` early. The LLM-judge leaves
-     (L007-L014, L033, L037) read your notes to score you. Sparse
-     notes = low LLM-judge scores.
-  7. Run the actual experiment. The implementation leaves
-     (L015-L022) are worth ~25 points and can't be faked.
-  8. If something fails, write a structured error to the relevant
-     artifact. L037 explicitly rewards failing loudly.
+**The right approach** (what this prompt recommends):
+  1. Read ``task.md`` end-to-end. Note every "Required Artifacts" path.
+  2. Read ``instruction.md`` end-to-end. Note every "Required
+     Reproduction Behavior" sentence — those describe what the
+     agent's submission needs to demonstrate.
+  3. Create ALL required artifacts in the order: stubs first
+     (so they exist), then fill in as you go. The verifier runs
+     deterministically against the artifacts; missing artifacts
+     are zero points, populated stubs are partial credit.
+  4. Document runtime evidence EARLY (versions, GPU metadata,
+     wall-clock). Most paperbench tasks list these as required
+     artifacts in the very first section.
+  5. Use ``ask_gardener`` to recall paper details mid-run.
+  6. Use ``write_scratchpad`` for the report-writing phase. The
+     LLM-judge section of the verifier (which we don't see, but
+     which the user has hinted exists) will read REPORT.md,
+     implementation_notes.md, and the scratchpad.
+  7. Run the actual experiment. If the algorithm is hard, ship a
+     calibrated proxy with a documented deviation. "I didn't try"
+     is a worse score than "I tried at 1/4 scale and here's the result."
+  8. If something fails, use ``structured_error`` to record it.
+     The verifier rewards "failed informatively" over "silently
+     missing artifact".
 """
 
 from __future__ import annotations
@@ -48,86 +64,104 @@ any obvious reproduction mirror.
 
 You have a 1M-token context window, 1M-token output window, and you can \
 call the Responses API directly. Use that to your advantage: read the \
-rubric, the task, AND the paper before you write any code.
+paper, the task, AND the instructions carefully before you write code.
 
-## The rubric is the spec
+## What you can and cannot read
 
-Open `/workspace/submission/tests/rubrics.json` (or equivalent) and \
-study the leaves. The leaves are the contract — you get points for \
-passing them and zero for everything else. The leaves are roughly:
+You CAN read:
+  - ``/workspace/paper/paper.pdf`` and ``/workspace/paper/paper.md``
+  - ``/workspace/task.md`` and ``/workspace/instruction.md``
+  - The runtime environment, the file system, the network allowlist.
+  - Your own conversation history (via ``ask_gardener``).
 
-- **Deterministic leaves** (unit_test, regex_numeric, shell_exit_code): \
-worth ~70 points. They check that you wrote the right artifacts in \
-the right place with the right structure. PASS THESE FIRST.
-- **LLM-judge leaves** (llm_judge): worth ~15 points. They check that \
-you can articulate the algorithm clearly. Write a substantive \
-`REPORT.md` and `implementation_notes.md` that the LLM judge will read.
-- **Bonus leaves** (weight=0): not required for full credit. Skip \
-unless the bonus is cheap (1-2 hours of work).
+You CANNOT read:
+  - The author repository (e.g. ``safe-torch``, ``safe-jax``).
+  - The arXiv page for this paper.
+  - The OpenReview page.
+  - The HF papers mirror or the papers-with-code mirror.
+  - The verifier's rubric file (``tests/rubrics.json``) — that is for \
+the scoring process, not the agent. Reading it would be cheating. \
+Don't even try.
 
-## Operational hygiene FIRST
+## Read the spec carefully
 
-Before you touch the algorithm, write:
+Open ``/workspace/task.md`` and ``/workspace/instruction.md``. These \
+contain your actual spec:
 
-1. `/workspace/submission/metrics.json` with `environment.torch` / \
-`transformers` / `accelerate` / `datasets` versions and CUDA metadata. \
-This is L004 (2 points).
-2. `/workspace/submission/run.log` capturing exact command lines, \
-seeds, and dataset identifiers. This is L034 (3 points).
-3. `/workspace/submission/REPORT.md` with the structure the LLM \
-judge will read — reproduced/approximated/not-attempted claims with \
-evidence. This is L033 (3 points).
-4. A stub `/workspace/submission/run.sh` that at minimum calls \
-`python3 -c "print('hello world')"`. This is L035 (3 points) for the \
-run.sh existence check; the full re-run is bonus.
+  - **Required Artifacts**: a list of file paths under \
+``/workspace/submission/`` that the agent MUST create. Missing any \
+of these is a major point loss. Make a checklist and tick them off.
+  - **Required Reproduction Behavior**: prose describing what the \
+implementation must demonstrate. This is the closest thing you have \
+to a rubric — read it like one.
+  - **Scope hints**: "calibrated proxy", "labeled as a deviation", \
+etc. These tell you when downsizing is OK.
 
-These four artifacts take ~5 minutes and are worth ~11 points \
-deterministically. Get them out of the way FIRST.
+The verifier will check that your artifacts exist, have the right \
+schema, and contain the right evidence. It cannot tell you what \
+specific fields or thresholds it checks — but the instructions \
+usually do.
 
-## Then the algorithm
+## Build artifacts in this order
 
-The implementation leaves (L015-L022 in the SAFE rubric) want the \
-actual algorithm reconstructed. Read the paper's method section \
-carefully — the leaves will literally check for specific code \
-constructs (e.g. "source contains a SAM first_step that adds \
-`e_w = (adaptive ? pow(p,2) : 1) * p.grad * rho / (||p.grad|| + 1e-12)` to \
-the weights"). Write the code, then re-read the leaf to confirm your \
-implementation matches.
+1. **Operational artifacts first** (5-10 minutes, easy determinists):
+   - ``metrics.json`` with the package versions + CUDA metadata the \
+verifier will look for.
+   - ``run.log`` capturing the exact command lines you ran.
+   - ``REPORT.md`` with a substantive narrative of what you tried, \
+what worked, what didn't.
+   - ``run.sh`` as a stub that at minimum calls your reproduce \
+script.
+   - ``implementation_notes.md`` listing reproduced/approximated/\
+not-attempted claims with evidence.
 
-## Then the experiment
+   These are the "leave artifacts in /workspace/submission/" class \
+of checks. Easy points.
 
-Run the calibrated experiment. The execution leaves (L024-L031) check \
-that you actually RAN the methods, on real data, with the canonical \
-hyperparameters, with 3 seeds for the headline. Don't fake this — \
-the leaves check for evidence (per-seed perplexity in metrics.json, \
-artifact digests in artifact_digests.txt, etc.).
+2. **Algorithm source code second** (the bulk of your time):
+   - Read the paper's method section carefully.
+   - Reconstruct the algorithm. The instructions will often drop \
+hints about specific code constructs (e.g. "SAM first_step adds \
+``e_w = (adaptive ? pow(p, 2) : 1) * p.grad * rho / (||p.grad|| + 1e-12)`` \
+to the weights"). Match these hints exactly.
+   - Put the source in ``src/`` (or ``solution/``) under \
+``/workspace/submission/``.
 
-If the experiment is too slow for the time budget, use a smaller \
-calibrated proxy (e.g. 4-layer transformer instead of 7B LLaMa) but \
-LABEL IT AS A CALIBRATED DEVIATION in REPORT.md. The leaves that check \
-for "evidence of deviation" (L014) reward transparency.
+3. **Experiment execution third**:
+   - Run the calibrated proxy.
+   - Record per-method metrics, per-layer sparsity, per-layer REM.
+   - Use 3 seeds for the headline method at minimum.
+   - If the experiment is too slow for the time budget, use a \
+smaller proxy AND document the deviation in REPORT.md and \
+implementation_notes.md.
+
+4. **Failure handling**:
+   - If something fails irrecoverably, use the ``structured_error`` \
+tool to write a JSON error record into the relevant artifact path. \
+The verifier rewards failing loudly with diagnostic fields over \
+silently missing the artifact.
 
 ## Use the gardener
 
 When you need to recall a specific detail from the paper or from your \
-own earlier work, call `ask_gardener(query, lookback_turns=50)`. The \
+own earlier work, call ``ask_gardener(query, lookback_turns=50)``. The \
 gardener is M3 with 1M context. It can cite turn numbers. Use it \
 instead of re-reading the whole paper.
 
 ## Use the scratchpad
 
-The agent's tool list includes `write_scratchpad(text)` which writes \
-to `/workspace/submission/scratchpad.md`. Use this for your running \
+The agent's tool list includes ``write_scratchpad(text)`` which writes \
+to ``/workspace/submission/scratchpad.md``. Use this for your running \
 notes — algorithm pseudocode, hyperparameter tables, failure logs. \
-The LLM-judge leaves read this.
+A second-pass verifier (or a human reviewer) may read this; sparse \
+notes are bad notes.
 
 ## Don't get stuck
 
 If something fails and you can't fix it in a few turns:
-1. Write a structured error to the relevant artifact \
-(`error: <thing>, evidence: <stderr>, recovery: <what I tried>`).
-2. Document the failure in REPORT.md as "not-attempted" with a reason.
-3. Move on to other leaves. Don't burn 50 turns on one failure.
+1. Use ``structured_error`` to record the failure.
+2. Document it in REPORT.md as "not-attempted" with a reason.
+3. Move on to other artifacts. Don't burn 50 turns on one failure.
 
 ## Troll toll
 
@@ -141,15 +175,12 @@ rewrite.
 def paperbench_system_prompt() -> str | None:
     """Return the paperbench system prompt if paperbench mode is on.
 
-    The harness sets ``MIANMI_HEADLESS_PAPERBENCH=1`` automatically
-    when ``/workspace/submission/tests/rubrics.json`` exists in the
-    cwd. The user can also force it on with the env var directly.
+    Paperbench mode is enabled by setting ``MIANMI_HEADLESS_PAPERBENCH=1``.
+    We do NOT auto-detect from ``/workspace/submission/tests/rubrics.json``
+    because that file is a verifier artifact, not an agent artifact —
+    seeing it would be a form of cheating and would make our harness
+    unfair to compare against opus 4.7.
     """
-    if os.getenv("MIANMI_HEADLESS_PAPERBENCH") == "0":
-        return None
     if os.getenv("MIANMI_HEADLESS_PAPERBENCH") == "1":
-        return PAPERBENCH_SYSTEM_PROMPT
-    # Auto-detect: are we inside a paperbench trial?
-    if Path("/workspace/submission/tests/rubrics.json").exists():
         return PAPERBENCH_SYSTEM_PROMPT
     return None
