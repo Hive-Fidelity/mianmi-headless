@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -65,6 +66,40 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_version(args: argparse.Namespace) -> int:
     print(f"mianmi-headless {__version__}")
+    return 0
+
+
+def _cmd_emit_trajectory(args: argparse.Namespace) -> int:
+    """Build an ATIF-v1.5 trajectory from the event log on disk.
+
+    Reads the events JSONL next to the turn log, converts to ATIF,
+    and writes to ``--output`` (default: ``<turn_log>.trajectory.json``).
+
+    Designed to be called by the harbor patch after the agent run
+    completes — the trajectory is the structured record harbor's
+    verifier reads. Does NOT require an OpenAI API key (we just
+    read the on-disk event log, no LLM call).
+    """
+    _setup_logging(verbose=args.verbose)
+    from mianmi_headless.agent import emit_trajectory_from_event_log
+    if args.turn_log:
+        turn_log = Path(args.turn_log)
+    else:
+        turn_log = Path(os.getenv("MIANMI_HEADLESS_TURN_LOG", "./turns.jsonl"))
+    event_log = turn_log.with_name(turn_log.stem + ".events.jsonl")
+    if not event_log.exists():
+        print(f"Error: event log not found: {event_log}", file=sys.stderr)
+        return 2
+    output = Path(args.output) if args.output else turn_log.with_name("trajectory.json")
+    session_id = args.session_id or os.getenv("MIANMI_HEADLESS_SESSION_ID")
+    traj = emit_trajectory_from_event_log(
+        event_log_path=event_log,
+        output_path=output,
+        main_model=args.model or os.getenv("MIANMI_HEADLESS_MODEL", "gpt-5.5"),
+        reasoning_effort=args.reasoning or os.getenv("MIANMI_HEADLESS_REASONING", "high"),
+        session_id=session_id,
+    )
+    print(f"wrote trajectory with {len(traj.get('steps', []))} steps to {output}")
     return 0
 
 
@@ -153,6 +188,20 @@ def main(argv: list[str] | None = None) -> int:
     p_self = sub.add_parser("self-test", help="Run smoke tests")
     p_self.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     p_self.set_defaults(func=_cmd_self_test)
+
+    p_emit = sub.add_parser(
+        "emit-trajectory",
+        help="Build an ATIF-v1.5 trajectory from the event log",
+    )
+    p_emit.add_argument("--turn-log", help="Path to the raw turn log JSONL")
+    p_emit.add_argument("--output", "-o", help="Output path (default: trajectory.json next to turn log)")
+    p_emit.add_argument("--model", help="Override the main model (for the agent section)")
+    p_emit.add_argument("--reasoning", help="Reasoning effort (for the agent section)")
+    p_emit.add_argument("--session-id", help="Override the session id (default: from env or random)")
+    p_emit.add_argument("--disable-gardener", action="store_true", help="Disable the M3 gardener")
+    p_emit.add_argument("--disable-troll", action="store_true", help="Disable the troll toll")
+    p_emit.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    p_emit.set_defaults(func=_cmd_emit_trajectory)
 
     args = parser.parse_args(argv)
 

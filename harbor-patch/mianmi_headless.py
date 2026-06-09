@@ -162,12 +162,17 @@ class MianmiHeadless(BaseInstalledAgent):
     ) -> None:
         """Run the agent on the task instruction.
 
-        The CLI runs the full agent loop and writes the raw turn log
-        to ``./turns.jsonl`` in the container's working dir. We
-        capture stdout (the final answer) into the agent dir for
-        harbor's verifier to read.
+        The CLI runs the full agent loop and writes:
+          - The raw turn log to ``./turns.jsonl`` (in the task working dir)
+          - The structured event log to ``./turns.events.jsonl``
+          - The final answer to stdout (captured to agent_dir)
+          - The ATIF-v1.5 trajectory to ``./trajectory.json`` (post-run)
+
+        harbor's verifier reads ``trajectory.json`` for structured
+        metrics; the raw turn log is the source of truth.
         """
         output_path = EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME
+        traj_path = EnvironmentPaths.agent_dir / "trajectory.json"
 
         # Build the command. All EnvVar values are auto-injected by
         # ``exec_as_agent`` via the ``_extra_env`` plumbing.
@@ -175,7 +180,8 @@ class MianmiHeadless(BaseInstalledAgent):
         model = self._resolved_env_vars.get("MIANMI_HEADLESS_MODEL", "gpt-5.5")
         reasoning = self._resolved_env_vars.get("MIANMI_HEADLESS_REASONING", "high")
 
-        cmd = (
+        # Phase 1: run the agent. stdout → agent_dir output file.
+        run_cmd = (
             "mianmi-headless run "
             f"--model {shlex.quote(model)} "
             f"--reasoning {shlex.quote(reasoning)} "
@@ -185,18 +191,54 @@ class MianmiHeadless(BaseInstalledAgent):
             f"{shlex.quote(instruction)} "
             f"2>&1 </dev/null | tee {output_path.as_posix()}"
         )
+        await self.exec_as_agent(environment, command=run_cmd)
 
-        await self.exec_as_agent(environment, command=cmd)
+        # Phase 2: convert the event log to an ATIF trajectory.
+        # Best-effort — if it fails (e.g. the agent crashed before
+        # writing any events), log and move on. harbor can still
+        # use the output file + raw turn log.
+        emit_cmd = (
+            "mianmi-headless emit-trajectory "
+            f"--turn-log ./turns.jsonl "
+            f"--output {traj_path.as_posix()} "
+            f"--model {shlex.quote(model)} "
+            f"2>&1 | tee -a {output_path.as_posix()}"
+        )
+        try:
+            await self.exec_as_agent(environment, command=emit_cmd)
+        except Exception:
+            # Non-fatal: harbor can still parse the raw turn log.
+            self.logger.warning("ATIF trajectory emission failed; continuing")
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        """Backfill context from the run output.
+        """Backfill context from the ATIF trajectory.
 
-        The CLI doesn't emit ATIF natively yet (it writes a raw turn
-        log instead), so we extract a minimal FinalMetrics by
-        reading the last ``## metrics`` block the CLI prints.
-        Stub for now — the raw turn log in ``turns.jsonl`` is the
-        real source of truth.
+        The CLI emits ``trajectory.json`` (ATIF-v1.5) via
+        ``mianmi-headless emit-trajectory``. We read its
+        ``final_metrics`` block to populate the harbor context.
+        Falls back to cheap text extraction from the output file
+        if the trajectory is missing.
         """
+        traj_path = self.logs_dir / "trajectory.json"
+        if traj_path.exists():
+            try:
+                import json
+                traj = json.loads(traj_path.read_text(encoding="utf-8"))
+            except Exception:
+                traj = None
+            if traj is not None:
+                fm = traj.get("final_metrics") or {}
+                if (v := fm.get("total_prompt_tokens")) is not None:
+                    context.n_input_tokens = v
+                if (v := fm.get("total_cached_tokens")) is not None:
+                    context.n_cache_tokens = v
+                if (v := fm.get("total_completion_tokens")) is not None:
+                    context.n_output_tokens = v
+                if (v := fm.get("total_cost_usd")) is not None:
+                    context.cost_usd = v
+                return
+
+        # Fallback: cheap text extraction from the output file.
         output_path = self.logs_dir / self._OUTPUT_FILENAME
         if not output_path.exists():
             return
@@ -204,9 +246,6 @@ class MianmiHeadless(BaseInstalledAgent):
             text = output_path.read_text(encoding="utf-8")
         except Exception:
             return
-        # Cheap token-count extraction if the CLI printed it.
-        # The real work is in turns.jsonl, which harbor can sync back
-        # via the trial's log dir.
         n_input = 0
         n_output = 0
         for line in text.splitlines():

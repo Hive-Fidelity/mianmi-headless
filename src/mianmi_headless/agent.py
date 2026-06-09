@@ -36,6 +36,15 @@ import httpx
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from mianmi_headless.atif import events_to_trajectory, validate_against_atif
+from mianmi_headless.events import (
+    AssistantTextEvent,
+    EventLog,
+    ReasoningEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+    UserEvent,
+)
 from mianmi_headless.tools import ToolContext, registry as default_tool_registry
 from mianmi_headless.troll import SEED_CATCHES, TrollToll
 from mianmi_headless.turn_log import Turn, TurnLog
@@ -228,6 +237,17 @@ class HeadlessAgent:
     def __init__(self, config: AgentConfig | None = None):
         self.config = config or AgentConfig()
         self.turn_log = TurnLog(self.config.turn_log_path)
+        # Parallel structured event log for ATIF trajectory conversion.
+        # Same lifetime as the turn log; same directory.
+        events_path = self.config.turn_log_path.with_name(
+            self.config.turn_log_path.stem + ".events.jsonl"
+        )
+        self.event_log = EventLog(events_path)
+        # Session ID is shared between turn log, event log, and
+        # ATIF trajectory. Persists across resumes (because the
+        # turn log appends; if we ever add resume support, we
+        # would read this back).
+        self.session_id = str(uuid.uuid4())
         # OpenAI client. Default base URL is the public OpenAI one;
         # users can override (e.g. Azure, an OpenAI-compat proxy) via
         # OPENAI_BASE_URL. We do NOT silently fall back to
@@ -281,6 +301,12 @@ class HeadlessAgent:
             turn_number=turn_number,
             role="user",
             content={"text": instruction},
+        ))
+        # Emit a user event for the ATIF trajectory.
+        self.event_log.append(UserEvent(
+            turn_number=turn_number,
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            text=instruction,
         ))
 
         # Build the Responses API tool list. Codex-native types:
@@ -402,6 +428,11 @@ class HeadlessAgent:
                     }
                     for c in tool_calls
                 ]
+            # Embed the iteration metrics so the ATIF converter can
+            # build a FinalMetrics block without re-parsing the
+            # turn log.
+            if usage_dict:
+                content_payload["metrics"] = usage_dict
             assistant_turn = Turn(
                 turn_number=self.turn_log.turn_count + 1,
                 role="assistant",
@@ -412,6 +443,42 @@ class HeadlessAgent:
                 usage=usage_dict,
             )
             self.turn_log.append(assistant_turn)
+
+            # Emit events for the ATIF trajectory. Reasoning first
+            # (if any), then the assistant text, then one event per
+            # tool call. The converter groups consecutive
+            # reasoning/assistant_text/tool_call events into a single
+            # Step.
+            turn_number = assistant_turn.turn_number
+            ts = assistant_turn.timestamp
+            if reasoning_text:
+                self.event_log.append(ReasoningEvent(
+                    turn_number=turn_number,
+                    timestamp=ts,
+                    text=reasoning_text,
+                ))
+            if text_parts:
+                self.event_log.append(AssistantTextEvent(
+                    turn_number=turn_number,
+                    timestamp=ts,
+                    text="\n".join(text_parts),
+                    # Embed metrics so the ATIF converter can attribute
+                    # them to this assistant turn.
+                    metrics=usage_dict,
+                ))
+            for c in tool_calls:
+                # Parse arguments back to a dict for ATIF
+                try:
+                    args_dict = json.loads(c["arguments"]) if c["arguments"] else {}
+                except json.JSONDecodeError:
+                    args_dict = {"raw": c["arguments"]}
+                self.event_log.append(ToolCallEvent(
+                    turn_number=turn_number,
+                    timestamp=ts,
+                    tool_call_id=c["call_id"],
+                    tool_name=c["name"],
+                    arguments=args_dict,
+                ))
 
             # No tool calls? We're done.
             if not tool_calls:
@@ -437,6 +504,24 @@ class HeadlessAgent:
                     tool_name=call["name"],
                     tool_call_id=call["call_id"],
                 ))
+                # Emit a ToolResultEvent for the ATIF trajectory.
+                # If the dispatcher captured a subagent trajectory
+                # (e.g. from the gardener), attach it to the event so
+                # the converter can emit a SubagentTrajectoryRef.
+                sub_traj = getattr(self, "_last_subagent_trajectory", None)
+                is_subagent = sub_traj is not None and call["name"] == "ask_gardener"
+                self.event_log.append(ToolResultEvent(
+                    turn_number=self.turn_log.turn_count,
+                    timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    source_call_id=call["call_id"],
+                    tool_name=call["name"],
+                    content=result_text,
+                    is_subagent=is_subagent,
+                    subagent_trajectory=sub_traj,
+                ))
+                # Clear the captured trajectory so the next tool call
+                # starts clean.
+                self._last_subagent_trajectory = None
 
         # If we hit the iteration cap, surface that.
         log.error("agent hit max_tool_iterations=%d, returning partial answer",
@@ -613,7 +698,44 @@ class HeadlessAgent:
                 resp = self.gardener_http.post("/v1/chat/completions", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
-                return data["choices"][0]["message"]["content"]
+                answer = data["choices"][0]["message"]["content"]
+                # Capture a sub-agent trajectory for the ATIF converter.
+                # The gardener ran in isolation: one system message,
+                # one user message (the question + history), one
+                # assistant message (the answer). We emit a minimal
+                # but valid ATIF trajectory so harbor can render it.
+                self._last_subagent_trajectory = {
+                    "schema_version": "ATIF-v1.5",
+                    "session_id": self.session_id,
+                    "trajectory_id": str(uuid.uuid4()),
+                    "agent": {
+                        "name": "mianmi-gardener",
+                        "version": "0.1.0",
+                        "model_name": self.config.gardener_model,
+                    },
+                    "steps": [
+                        {
+                            "step_id": 1,
+                            "timestamp": time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                            ),
+                            "source": "user",
+                            "message": f"[gardener context: {len(slice_)} turns] {query}",
+                        },
+                        {
+                            "step_id": 2,
+                            "timestamp": time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                            ),
+                            "source": "agent",
+                            "message": answer,
+                            "model_name": self.config.gardener_model,
+                            "llm_call_count": 1,
+                        },
+                    ],
+                    "final_metrics": {"total_steps": 2},
+                }
+                return answer
             except httpx.HTTPError as e:
                 return f"Error: gardener call failed: {e}"
             except Exception as e:
@@ -644,5 +766,73 @@ class HeadlessAgent:
 
     def close(self) -> None:
         self.turn_log.close()
+        self.event_log.close()
         if self.gardener_http is not None:
             self.gardener_http.close()
+
+    # ---- trajectory emission ---------------------------------------- #
+
+    def emit_trajectory(
+        self,
+        path: str | Path | None = None,
+        *,
+        tool_definitions: list[dict] | None = None,
+    ) -> dict:
+        """Build an ATIF-v1.5 trajectory from the event log.
+
+        The trajectory is the structured record of everything the
+        agent did — designed for harbor's verifier to read after
+        a trial. By default it's written to ``<turn_log_dir>/trajectory.json``.
+
+        Returns the dict (also useful for tests).
+        """
+        return emit_trajectory_from_event_log(
+            event_log_path=self.event_log.path,
+            output_path=path or self.config.turn_log_path.with_name("trajectory.json"),
+            main_model=self.config.main_model,
+            reasoning_effort=self.config.reasoning_effort,
+            session_id=self.session_id,
+            tool_definitions=tool_definitions,
+        )
+
+
+def emit_trajectory_from_event_log(
+    *,
+    event_log_path: Path,
+    output_path: Path,
+    main_model: str = "mianmi-headless",
+    reasoning_effort: str | None = None,
+    session_id: str | None = None,
+    tool_definitions: list[dict] | None = None,
+) -> dict:
+    """Build an ATIF trajectory from an event log file on disk.
+
+    Standalone function — no agent construction needed. Used by
+    the CLI's ``emit-trajectory`` subcommand and by ``HeadlessAgent.emit_trajectory``.
+    """
+    from mianmi_headless.events import EventLog
+    log = EventLog(event_log_path)
+    try:
+        events = list(log.iter_events())
+    finally:
+        log.close()
+    traj = events_to_trajectory(
+        events,
+        agent_name="mianmi-headless",
+        agent_version="0.1.0",
+        model_name=main_model,
+        tool_definitions=tool_definitions,
+        reasoning_effort=reasoning_effort,
+        session_id=session_id,
+    )
+    errors = validate_against_atif(traj)
+    if errors:
+        log_msg = logging.getLogger("mianmi_headless.atif")
+        log_msg.warning("ATIF trajectory has %d validation errors: %s", len(errors), errors)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(traj, f, indent=2, default=str)
+    logger = logging.getLogger("mianmi_headless.atif")
+    logger.info("wrote ATIF trajectory to %s (%d steps)", output_path, len(traj.get("steps", [])))
+    return traj
